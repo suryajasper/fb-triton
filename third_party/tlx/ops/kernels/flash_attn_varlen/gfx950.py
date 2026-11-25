@@ -5,8 +5,10 @@ Q/K/V are packed ``(tokens, heads, 128)``; sequence ``b`` owns query rows
 ``cu_seqlens_k[b]:cu_seqlens_k[b + 1]``. Causal masking is bottom-right
 aligned: query row ``i`` of a sequence sees keys ``j <= i + k_len - q_len``.
 
-Each workgroup is one 64-row query tile of one (sequence, head), on 4 warps of
-16 rows. Short sequences give few tiles (B = 10 x 1000 tokens is 160 for 256
+Workgroups use 64-row tiles by default and 32-row tiles for small causal grids
+with at least eight 64-row query blocks and fewer than one-eighth as many items
+as CUs. The 64-row path overlaps the masked tail with final unmasked PV;
+short 32-row chunks retain their independently measured pipeline. Short sequences give few tiles (B = 10 x 1000 tokens is 160 for 256
 CUs), so the tiles stay small and the time is per-tile latency:
 
 - Workgroups go round-robin to the 8 XCDs; each XCD gets a contiguous run of
@@ -47,7 +49,7 @@ NUM_WARPS = 4
 # BIG_BLOCK_N_MAX_SPLIT 64-key blocks. With splits this short the merging
 # workgroup finishes last, and its merge completes sooner with 128-key blocks.
 BIG_BLOCK_N = 128
-BIG_BLOCK_N_MAX_SPLIT = 10
+BIG_BLOCK_N_MAX_SPLIT = 13
 # Causal split: the smallest SPLIT >= 4 that gives every work item its own CU
 # and stores at most 64 partials (each partial's release writes back its XCD's
 # L2, so more splits than that cost more than they save).
@@ -62,7 +64,7 @@ COUNTER_ROWS = 16
 def _qk(q0, q1, q2, q3, k_slot, BLOCK_N: tl.constexpr):
     # Q arrives as four 32-wide head-dim chunks: extract_slice on a
     # layout-pinned helper argument crashes the TLX fixup pass.
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=([2, 2] if q0.shape[0] == 32 else [4, 1]))
     kl: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=8)
     n: tl.constexpr = k_slot.shape[0]
     s = tlx.zeros((q0.shape[0], BLOCK_N), tl.float32, layout=mma)
@@ -80,9 +82,10 @@ def _qk(q0, q1, q2, q3, k_slot, BLOCK_N: tl.constexpr):
     return tl.dot(q3, k3, s)
 
 
+
 @triton.jit
 def _pv(p, v_slot, acc0, acc1, acc2, acc3):
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=([2, 2] if p.shape[0] == 32 else [4, 1]))
     vl: tl.constexpr = tlx.dot_operand_layout(1, mma, k_width=4)
     n: tl.constexpr = v_slot.shape[0]
     p = tlx.require_layout(p, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
@@ -93,46 +96,50 @@ def _pv(p, v_slot, acc0, acc1, acc2, acc3):
     return tl.dot(p, v0, acc0), tl.dot(p, v1, acc1), tl.dot(p, v2, acc2), tl.dot(p, v3, acc3)
 
 
+
 @triton.jit
-def _read_k(k_slot, col: tl.constexpr):
+def _read_k(k_slot, col: tl.constexpr, ROWS: tl.constexpr = 64):
     # Read the 32 head-dim columns starting at col, for every key of the LDS K
     # block, transposed into the B operand of a QK dot.
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=([2, 2] if ROWS == 32 else [4, 1]))
     n: tl.constexpr = k_slot.shape[0]
     return tlx.require_layout(tlx.local_load(tlx.local_trans(tlx.local_slice(k_slot, [0, col], [n, 32])), relaxed=True),
                               tlx.dot_operand_layout(1, mma, k_width=8), pin=False)
 
 
+
 @triton.jit
-def _read_v(v_slot, col: tl.constexpr):
+def _read_v(v_slot, col: tl.constexpr, ROWS: tl.constexpr = 64):
     # Read the 32 head-dim columns starting at col, for every key of the LDS V
     # block, as the B operand of the PV dot into the matching accumulator.
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=([2, 2] if ROWS == 32 else [4, 1]))
     n: tl.constexpr = v_slot.shape[0]
     return tlx.require_layout(tlx.local_load(tlx.local_slice(v_slot, [0, col], [n, 32]), relaxed=True),
                               tlx.dot_operand_layout(1, mma, k_width=4), pin=False)
 
 
+
 @triton.jit
 def _qk_interleaved(q0, q1, q2, q3, k_slot, v_src, v_dst, BLOCK_N: tl.constexpr):
     # QK of the first key block, with the V(0) copy riding the first dot.
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=([2, 2] if q0.shape[0] == 32 else [4, 1]))
     s = tlx.zeros((q0.shape[0], BLOCK_N), tl.float32, layout=mma)
-    k0 = _read_k(k_slot, 0)
+    k0 = _read_k(k_slot, 0, q0.shape[0])
     with tlx.warp_pipeline_stage("v_copy_read_k1", scope="intra_wave", pair=0):
         tlx.async_load_commit_group([tlx.async_load(v_src, v_dst)])
-        k1 = _read_k(k_slot, 32)
+        k1 = _read_k(k_slot, 32, q0.shape[0])
     with tlx.warp_pipeline_stage("qk0", scope="intra_wave", pair=0):
         s = tl.dot(q0, k0, s)
     with tlx.warp_pipeline_stage("read_k2", scope="intra_wave", pair=1):
-        k2 = _read_k(k_slot, 64)
+        k2 = _read_k(k_slot, 64, q0.shape[0])
     with tlx.warp_pipeline_stage("qk1", scope="intra_wave", pair=1):
         s = tl.dot(q1, k1, s)
     with tlx.warp_pipeline_stage("read_k3", scope="intra_wave", pair=2):
-        k3 = _read_k(k_slot, 96)
+        k3 = _read_k(k_slot, 96, q0.shape[0])
     with tlx.warp_pipeline_stage("qk2", scope="intra_wave", pair=2):
         s = tl.dot(q2, k2, s)
     return tl.dot(q3, k3, s)
+
 
 
 @triton.jit
@@ -142,42 +149,43 @@ def _qk_pv_interleaved(q0, q1, q2, q3, p, k_slot, v_slot, acc0, acc1, acc2, acc3
     # QK of the next key block and PV of the current one, each dot paired with
     # the LDS read of the operand the next dot needs; the next V and K copies
     # ride with the first two dots.
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=([2, 2] if q0.shape[0] == 32 else [4, 1]))
     p = tlx.require_layout(p, tlx.dot_operand_layout(0, mma, k_width=4), pin=False)
     s = tlx.zeros((q0.shape[0], BLOCK_N), tl.float32, layout=mma)
-    k0 = _read_k(k_slot, 0)
+    k0 = _read_k(k_slot, 0, q0.shape[0])
     with tlx.warp_pipeline_stage("v_copy_read_v0", scope="intra_wave", pair=0):
         tlx.async_load_commit_group([tlx.async_load(v_src, v_dst)])
-        v0 = _read_v(v_slot, 0)
+        v0 = _read_v(v_slot, 0, q0.shape[0])
     with tlx.warp_pipeline_stage("qk0", scope="intra_wave", pair=0):
         s = tl.dot(q0, k0, s)
     with tlx.warp_pipeline_stage("k_copy_read_k1", scope="intra_wave", pair=1):
         tlx.async_load_commit_group([tlx.async_load(k_src, k_dst)])
-        k1 = _read_k(k_slot, 32)
+        k1 = _read_k(k_slot, 32, q0.shape[0])
     with tlx.warp_pipeline_stage("pv0", scope="intra_wave", pair=1):
         acc0 = tl.dot(p, v0, acc0)
     with tlx.warp_pipeline_stage("read_v1", scope="intra_wave", pair=2):
-        v1 = _read_v(v_slot, 32)
+        v1 = _read_v(v_slot, 32, q0.shape[0])
     with tlx.warp_pipeline_stage("qk1", scope="intra_wave", pair=2):
         s = tl.dot(q1, k1, s)
     with tlx.warp_pipeline_stage("read_k2", scope="intra_wave", pair=3):
-        k2 = _read_k(k_slot, 64)
+        k2 = _read_k(k_slot, 64, q0.shape[0])
     with tlx.warp_pipeline_stage("pv1", scope="intra_wave", pair=3):
         acc1 = tl.dot(p, v1, acc1)
     with tlx.warp_pipeline_stage("read_v2", scope="intra_wave", pair=4):
-        v2 = _read_v(v_slot, 64)
+        v2 = _read_v(v_slot, 64, q0.shape[0])
     with tlx.warp_pipeline_stage("qk2", scope="intra_wave", pair=4):
         s = tl.dot(q2, k2, s)
     with tlx.warp_pipeline_stage("read_k3", scope="intra_wave", pair=5):
-        k3 = _read_k(k_slot, 96)
+        k3 = _read_k(k_slot, 96, q0.shape[0])
     with tlx.warp_pipeline_stage("pv2", scope="intra_wave", pair=5):
         acc2 = tl.dot(p, v2, acc2)
     with tlx.warp_pipeline_stage("read_v3", scope="intra_wave", pair=6):
-        v3 = _read_v(v_slot, 96)
+        v3 = _read_v(v_slot, 96, q0.shape[0])
     with tlx.warp_pipeline_stage("qk3", scope="intra_wave", pair=6):
         s = tl.dot(q3, k3, s)
     acc3 = tl.dot(p, v3, acc3)
     return s, acc0, acc1, acc2, acc3
+
 
 
 @triton.jit
@@ -295,7 +303,20 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
     if m_block * BLOCK_M >= q_len:
         return
 
-    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[4, 1])
+    mma: tl.constexpr = tlx.amd_mfma_layout(version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=([2, 2] if BLOCK_M == 32 else [4, 1]))
+    if BLOCK_N == 64:
+        kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [(512, 16)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0],
+                          [4, 0], [8, 0]], [BLOCK_N, HEAD_DIM])
+    else:
+        tl.static_assert(BLOCK_N == 128)
+        kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [(512, 16)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0],
+                          [4, 0], [8, 0], [64, 0]], [BLOCK_N, HEAD_DIM])
+    if BLOCK_M == 32:
+        q_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
+            [(512, 16)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [1, 0], [2, 0], [4, 0], [8, 0]], [BLOCK_M, HEAD_DIM])
+    overlap_tail: tl.constexpr = BLOCK_M == 64 and (SPLIT == 0 or SPLIT > 4)
     offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
@@ -327,18 +348,15 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
     # Padded rows and the dense bases [[0, 1] .. [0, 64], [16, 0], [32, 0],
     # [1, 0] .. [8, 0]] keep the K^T and V chunk reads free of bank conflicts;
     # a 128-row block is two such 64-row halves.
-    if BLOCK_N == 64:
-        kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-            [(512, 16)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0],
-                          [4, 0], [8, 0]], [BLOCK_N, HEAD_DIM])
-    else:
-        tl.static_assert(BLOCK_N == 128)
-        kv_layout: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases(
-            [(512, 16)], [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [1, 0], [2, 0],
-                          [4, 0], [8, 0], [64, 0]], [BLOCK_N, HEAD_DIM])
     k_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), K.dtype.element_ty, 2, layout=kv_layout)
     v_buf = tlx.local_alloc((BLOCK_N, HEAD_DIM), V.dtype.element_ty, 2, layout=kv_layout)
-    q_slot = tlx.local_slice(tlx.local_view(v_buf, 1), [0, 0], [BLOCK_M, HEAD_DIM])
+    if BLOCK_M == 32:
+        # A genuine 32-row layout avoids the zero lane basis of a 32-row view
+        # into the 64-row V allocation, which is not a legal direct-LDS copy.
+        q_buf = tlx.local_alloc((BLOCK_M, HEAD_DIM), Q.dtype.element_ty, 1, layout=q_layout)
+        q_slot = tlx.local_view(q_buf, 0)
+    else:
+        q_slot = tlx.local_slice(tlx.local_view(v_buf, 1), [0, 0], [BLOCK_M, HEAD_DIM])
     tok_q = tlx.async_load(q_ptrs, q_slot, mask=row_ok[:, None])
     tlx.async_load_commit_group([tok_q])
     tlx.async_load_wait_group(0)
@@ -385,25 +403,35 @@ def _flash_attn_varlen_fwd(Q, K, V, Out, CuQ, CuK, Part, Count, stride_qt, strid
                                                            Q.dtype.element_ty)
         tlx.async_load_wait_group(0)
         tl.debug_barrier()
+        if overlap_tail and full < n_blocks:
+            tail_slot = 1 - last % 2
+            tail_ok = (full * BLOCK_N + offs_n < k_len)[:, None]
+            tok_k = tlx.async_load(k_ptrs + full * k_step, tlx.local_view(k_buf, tail_slot), mask=tail_ok)
+            tok_v = tlx.async_load(v_ptrs + full * v_step, tlx.local_view(v_buf, tail_slot), mask=tail_ok)
+            tlx.async_load_commit_group([tok_k, tok_v])
         acc0, acc1, acc2, acc3 = _pv(p, tlx.local_view(v_buf, last % 2), acc0, acc1, acc2, acc3)
         tl.debug_barrier()
 
     for blk in tl.range(full, n_blocks, num_stages=1):
         cols = blk * BLOCK_N + offs_n
         kv_ok = (cols < k_len)[:, None]
-        tok_k = tlx.async_load(k_ptrs + blk * k_step, tlx.local_view(k_buf, 0), mask=kv_ok)
-        tok_v = tlx.async_load(v_ptrs + blk * v_step, tlx.local_view(v_buf, 0), mask=kv_ok)
-        tlx.async_load_commit_group([tok_k, tok_v])
+        slot = 0
+        if overlap_tail and blk == full and full > lo:
+            slot = 1 - (full - lo - 1) % 2
+        else:
+            tok_k = tlx.async_load(k_ptrs + blk * k_step, tlx.local_view(k_buf, slot), mask=kv_ok)
+            tok_v = tlx.async_load(v_ptrs + blk * v_step, tlx.local_view(v_buf, slot), mask=kv_ok)
+            tlx.async_load_commit_group([tok_k, tok_v])
         tlx.async_load_wait_group(0)
         tl.debug_barrier()
-        s = _qk(q0, q1, q2, q3, tlx.local_view(k_buf, 0), BLOCK_N)
+        s = _qk(q0, q1, q2, q3, tlx.local_view(k_buf, slot), BLOCK_N)
         valid = cols[None, :] < k_len
         if IS_CAUSAL:
             valid = valid & (cols[None, :] <= offs_m[:, None] + causal_off)
         s = tl.where(valid, s, float("-inf"))
         m_i, l_i, p, acc0, acc1, acc2, acc3 = _softmax(s, m_i, l_i, acc0, acc1, acc2, acc3, qk_scale,
                                                        Q.dtype.element_ty)
-        acc0, acc1, acc2, acc3 = _pv(p, tlx.local_view(v_buf, 0), acc0, acc1, acc2, acc3)
+        acc0, acc1, acc2, acc3 = _pv(p, tlx.local_view(v_buf, slot), acc0, acc1, acc2, acc3)
         tl.debug_barrier()
 
     if SPLIT > 0:
@@ -488,21 +516,29 @@ def _split_scratch(device, cus):
     return scratch
 
 
+def _launch_plan(bh, max_seqlen_q, cus, causal):
+    """Physical row tile, item count, split plan, and paired-row scheduling."""
+    num_m_blocks = triton.cdiv(max_seqlen_q, BLOCK_M)
+    if causal and num_m_blocks >= 8 and bh * num_m_blocks < cus // 8:
+        small_blocks = triton.cdiv(max_seqlen_q, 32)
+        split, items_per_bh, max_splits = _split_plan(bh, small_blocks, cus)
+        return 32, small_blocks, split, items_per_bh, max_splits, False
+    split, items_per_bh, max_splits = _split_plan(bh, num_m_blocks, cus) if causal else (0, num_m_blocks, 1)
+    return BLOCK_M, num_m_blocks, split, items_per_bh, max_splits, False
+
+
 def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scale, causal):
     """Launch the forward; inputs are validated by ``tlx.ops.flash_attn_varlen``."""
     heads, head_dim = q.shape[1], q.shape[2]
     if sm_scale is None:
         sm_scale = head_dim**-0.5
     out = torch.empty_like(q)
-    num_m_blocks = triton.cdiv(max_seqlen_q, BLOCK_M)
     bh = (cu_seqlens_q.shape[0] - 1) * heads
+    cus = _num_cus(q.device)
+    block_m, num_m_blocks, split, items_per_bh, max_splits, _ = _launch_plan(bh, max_seqlen_q, cus, causal)
     if bh * num_m_blocks == 0:
         return out
-    split, items_per_bh, max_splits = 0, num_m_blocks, 1
     part = count = None
-    if causal:
-        cus = _num_cus(q.device)
-        split, items_per_bh, max_splits = _split_plan(bh, num_m_blocks, cus)
     if split:
         scratch = _split_scratch(q.device, cus)
         if scratch is None:
@@ -515,16 +551,16 @@ def flash_attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, sm_scal
     q_stride, k_stride, v_stride, o_stride = q.stride(), k.stride(), v.stride(), out.stride()
     # Only the flags that are set are passed: every keyword argument adds host time to each launch.
     i64 = {}
-    if _needs_i64_offsets(q.shape, q_stride, BLOCK_M):
+    if _needs_i64_offsets(q.shape, q_stride, block_m):
         i64["USE_I64_Q_OFFSETS"] = True
     if _needs_i64_offsets(k.shape, k_stride, block_n) or _needs_i64_offsets(v.shape, v_stride, block_n):
         i64["USE_I64_KV_OFFSETS"] = True
-    if _needs_i64_offsets(out.shape, o_stride, BLOCK_M):
+    if _needs_i64_offsets(out.shape, o_stride, block_m):
         i64["USE_I64_O_OFFSETS"] = True
     _flash_attn_varlen_fwd[grid](q, k, v, out, cu_seqlens_q, cu_seqlens_k, part, count, q_stride[0], q_stride[1],
                                  k_stride[0], k_stride[1], v_stride[0], v_stride[1], o_stride[0], o_stride[1],
                                  sm_scale * 1.4426950408889634, heads, heads // k.shape[1], num_m_blocks, items_per_bh,
-                                 n_items, BLOCK_M=BLOCK_M, BLOCK_N=block_n, HEAD_DIM=head_dim, IS_CAUSAL=causal,
+                                 n_items, BLOCK_M=block_m, BLOCK_N=block_n, HEAD_DIM=head_dim, IS_CAUSAL=causal,
                                  SPLIT=split, num_warps=NUM_WARPS, waves_per_eu=0, matrix_instr_nonkdim=16, kpack=1,
                                  **i64)
     return out
